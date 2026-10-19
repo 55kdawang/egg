@@ -1,0 +1,1606 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="theme-color" content="#ffffff" />
+<title>egg</title>
+<link rel="icon" href="1.png" />
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #ffffff; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  #game { display: block; touch-action: none; cursor: pointer; }
+  #err {
+    position: fixed; inset: 0; display: none; place-items: center;
+    text-align: center; padding: 24px; color: #b32020;
+    font-size: 14px; line-height: 1.7; background: #fff;
+  }
+  #err code { background: #f3f3f3; padding: 2px 6px; border-radius: 4px; color: #333; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="err">
+  图片加载失败。<br>
+  请把 <code>1.webp ~ 9.webp</code>、<code>bomb.webp</code> 和 <code>index.html</code> 放在同一个文件夹里再打开。
+</div>
+<script>
+(function () {
+  'use strict';
+
+  window.addEventListener('error', function (ev) {
+    const box = document.getElementById('err');
+    if (box) {
+      box.style.display = 'grid';
+      box.textContent = '运行出错：' + (ev.message || ev.error) + ' @' + (ev.lineno || '?');
+    }
+  });
+
+  /* ==========================================================
+     1. 尺寸与布局（虚拟坐标，画布等比缩放）
+     ========================================================== */
+  const VW = 620, VH = 1000;             // 画布
+  const GAME_W = VW;                     // 棋盘宽度
+
+  const HUD  = { x: 16, y: 16, w: GAME_W - 32, h: 68, r: 20 };
+  const BELT = { x: 16, y: 96, w: GAME_W - 32, h: 84, r: 42 };
+  BELT.cy = BELT.y + BELT.h / 2;
+  const BOX  = { x: 16, y: 360, w: GAME_W - 32, h: VH - 360 - 16 };
+  const FRAME = 9;
+  const FIELD = {
+    left:   BOX.x + FRAME,
+    right:  BOX.x + BOX.w - FRAME,
+    bottom: BOX.y + BOX.h - FRAME
+  };
+  const LINE_Y = BOX.y + FRAME;          // 红色满线（框内顶边）
+  const DANGER_Y = LINE_Y + 4;           // 判定“碰到线”
+  const BELT_R = 30;                     // 顶部一排：所有蛋同样大小
+  const SPACING = 70;
+  const BELT_SPEED = 42;                 // px / s，从左往右滚动
+  const BELT_COUNT = 8;
+
+  // 1~4 级：在原尺寸基础上放大 50%（小蛋更好认）
+  // 5~9 级：不再翻倍，只顺着 4 级往上留出可分辨的台阶
+  // 约束：4 级(84) < 5 级(94)
+  const LEVELS = [null,
+    { r: 24 },     // 1   直径 48（原 32，+50%）
+    { r: 29 },     // 2   58（原 39，+49%）
+    { r: 35 },     // 3   70（原 47，+49%）
+    { r: 42 },     // 4   84（原 56，+50%）
+    { r: 47 },     // 5   94
+    { r: 54 },     // 6   108
+    { r: 62 },     // 7   124
+    { r: 71 },     // 8   142
+    { r: 81 }      // 9   162
+  ];
+  LEVELS[0] = { r: 26 };                 // 0 = 炸弹，不算等级
+  const MAX_LEVEL = 9;
+  const SPRITE_K = 1.2;                  // 图片高度 / 碰撞直径
+  const BLAST_R = 96;                    // 炸弹清除半径（“一小片”）
+  const BOMB_PTS = 250;                  // 炸弹爆炸得分
+  const LEVEL_COLORS = ['#e8703a', '#d9bfa6', '#cfe08a', '#586074', '#4a4f66', '#e8e4de',
+    '#3a4f8a', '#3c4048', '#e8c65a', '#6a4a58'];
+
+  // 出场权重：低等级不再刷屏，高等级略微增加，进度更快
+  const SPAWN = [
+    { lv: 0, w: 4 },     // 炸弹
+    { lv: 1, w: 34 },
+    { lv: 2, w: 27 },
+    { lv: 3, w: 18 },
+    { lv: 4, w: 12 },
+    { lv: 5, w: 8 },
+    { lv: 6, w: 1 }
+  ];
+  const SPAWN_TOTAL = SPAWN.reduce(function (s, o) { return s + o.w; }, 0);
+
+  // 连击：一次投蛋引发的连续合成算一串；达到 3 连后每次额外 +100
+  const COMBO_GAP   = 1.2;   // 两次合成间隔超过这个时间就断连
+  const COMBO_BONUS = 100;
+  const COMBO_MIN   = 3;
+
+  // 合成得分：2 级 50、3 级 75、4 级 100 … 9 级 225
+  function mergePoints(level) { return 50 + (level - 2) * 25; }
+
+  /* ==========================================================
+     2. 物理参数
+     ========================================================== */
+  const GRAV      = 2000;
+  const MAXV      = 1500;
+  const DT        = 1 / 120;
+  const ITERS     = 4;
+  const REST      = 0.16;    // 蛋与蛋
+  const FRIC      = 0.30;
+  const WALL_REST = 0.22;    // 蛋与墙
+  const WALL_FRIC = 0.50;
+  const POS_PCT   = 0.55;
+  const SLOP      = 0.15;
+
+  /* ==========================================================
+     3. 画布
+     ========================================================== */
+  const cv  = document.getElementById('game');
+  const ctx = cv.getContext('2d');
+  let scale = 1, dpr = 1;
+
+  function resize() {
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    scale = Math.min(window.innerWidth / VW, window.innerHeight / VH);
+    const cw = Math.round(VW * scale), ch = Math.round(VH * scale);
+    cv.style.width  = cw + 'px';
+    cv.style.height = ch + 'px';
+    cv.width  = Math.round(cw * dpr);
+    cv.height = Math.round(ch * dpr);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ==========================================================
+     4. 资源
+     ========================================================== */
+  const sprites = {};        // level -> { cv, aspect, color }
+  let assetsReady = false;
+
+  function buildSprite(img, level) {
+    const aspect = img.width / img.height;
+    const H = 320;
+    const W = Math.max(1, Math.round(H * aspect));
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const g = c.getContext('2d');
+    g.drawImage(img, 0, 0, W, H);
+
+    // 取平均色（用于粒子 / 光环）。file:// 下画布可能被污染，用预设色兜底。
+    let color = LEVEL_COLORS[level] || '#d8c3ae';
+    try {
+      const s = document.createElement('canvas');
+      s.width = 24; s.height = 24;
+      const sg = s.getContext('2d');
+      sg.drawImage(img, 0, 0, 24, 24);
+      const d = sg.getImageData(0, 0, 24, 24).data;
+      let r = 0, gg = 0, b = 0, n = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] < 40) continue;
+        r += d[i]; gg += d[i + 1]; b += d[i + 2]; n++;
+      }
+      if (n) color = 'rgb(' + (r / n | 0) + ',' + (gg / n | 0) + ',' + (b / n | 0) + ')';
+    } catch (e) { /* file:// 上极少见，忽略 */ }
+    return { cv: c, aspect: aspect, color: color };
+  }
+
+  function loadAssets() {
+    // 下标即等级：0 = 炸弹，1~9 = 普通蛋
+    const list = ['bomb.webp', '1.webp', '2.webp', '3.webp', '4.webp',
+      '5.webp', '6.webp', '7.webp', '8.webp', '9.webp'];
+    Promise.all(list.map(function (name) {
+      return new Promise(function (res, rej) {
+        const im = new Image();
+        im.onload = function () { res(im); };
+        im.onerror = function () { rej(new Error('load fail ' + name)); };
+        im.src = name;
+      });
+    })).then(function (imgs) {
+      imgs.forEach(function (im, i) {
+        sprites[i] = buildSprite(im, i);
+        if (i === 0) sprites[i].tint = buildTint(sprites[i].cv);   // 拖拽时的红色闪烁层
+      });
+      assetsReady = true;
+      state.started = true;
+    }).catch(function () {
+      document.getElementById('err').style.display = 'grid';
+    });
+  }
+
+  // 生成一张纯红剪影，用于拖拽炸弹时闪色
+  function buildTint(src) {
+    const c = document.createElement('canvas');
+    c.width = src.width; c.height = src.height;
+    const g = c.getContext('2d');
+    g.drawImage(src, 0, 0);
+    g.globalCompositeOperation = 'source-atop';
+    g.fillStyle = 'rgba(255, 62, 40, 1)';
+    g.fillRect(0, 0, c.width, c.height);
+    return c;
+  }
+
+  /* ==========================================================
+     5. 声音（无素材，WebAudio 实时合成，可静音）
+        - 一条母线：总音量 + 轻压缩，多个声部同时响也不会削波
+        - 核心音效：蛋落进框 / 合成 / 炸弹爆炸，都由「音调 + 噪声」叠出来
+     ========================================================== */
+  const MUTE_KEY = 'egg.muted';
+  let actx = null, bus = null, noiseBuf = null, voices = 0;
+  let muted = (localStorage.getItem(MUTE_KEY) === '1');
+  const MAX_VOICES = 32;          // 同时发声上限：连锁爆炸时不至于糊成一片
+  const VOLUME = 2.4;             // 总音量：嫌吵改小、还不够大就调大（建议 1.5 ~ 3.5）
+
+  /* ---- 惰性建图：只在用户手势里才真正出声 ---- */
+  function audio() {
+    if (muted) return null;
+    try {
+      if (!actx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        actx = new AC();
+
+        bus = actx.createGain();
+        bus.gain.value = VOLUME;
+
+        // 轻压缩：把叠加的声部压在一起，避免爆音
+        if (typeof actx.createDynamicsCompressor === 'function') {
+          const comp = actx.createDynamicsCompressor();
+          comp.threshold.value = -10;
+          comp.knee.value = 30;
+          comp.ratio.value = 4;
+          comp.attack.value = 0.003;
+          comp.release.value = 0.2;
+          bus.connect(comp);
+          comp.connect(actx.destination);
+        } else {
+          bus.connect(actx.destination);
+        }
+
+        // 1 秒白噪声，打击 / 风声 / 爆炸共用
+        const n = Math.max(1, Math.floor(actx.sampleRate));
+        noiseBuf = actx.createBuffer(1, n, actx.sampleRate);
+        const data = noiseBuf.getChannelData(0);
+        for (let i = 0; i < n; i++) data[i] = Math.random() * 2 - 1;
+      }
+      if (actx.state === 'suspended') actx.resume();
+      return actx;
+    } catch (e) { return null; }
+  }
+
+  // 浏览器要求第一个用户手势里解冻音频
+  function unlockAudio() { if (!muted) audio(); }
+
+  // 单个音：f 起始频率，to 结束频率（相等则不滑音），delay 为相对延迟秒数
+  function note(f, to, dur, type, peak, delay) {
+    const a = audio();
+    if (!a || voices >= MAX_VOICES) return;
+    const t = a.currentTime + (delay || 0);
+    const o = a.createOscillator();
+    const g = a.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f, t);
+    if (to && to !== f) o.frequency.exponentialRampToValueAtTime(Math.max(16, to), t + dur);
+    const atk = Math.min(0.012, dur * 0.3);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0004, peak), t + atk);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g);
+    g.connect(bus);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+    voices++;
+    o.onended = function () { voices = Math.max(0, voices - 1); };
+  }
+
+  // 一段噪声：带通 / 低通 / 高通扫频，用来做打击、风声、火球
+  function noise(dur, peak, f0, f1, q, type, delay) {
+    const a = audio();
+    if (!a || voices >= MAX_VOICES) return;
+    const t = a.currentTime + (delay || 0);
+    const s = a.createBufferSource();
+    s.buffer = noiseBuf;
+    s.loop = true;
+    const flt = a.createBiquadFilter();
+    flt.type = type || 'lowpass';
+    flt.Q.value = q == null ? 1 : q;
+    flt.frequency.setValueAtTime(f0, t);
+    if (f1 && f1 !== f0) flt.frequency.exponentialRampToValueAtTime(Math.max(40, f1), t + dur);
+    const g = a.createGain();
+    const atk = Math.min(0.006, dur * 0.25);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0004, peak), t + atk);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(flt); flt.connect(g); g.connect(bus);
+    s.start(t);
+    s.stop(t + dur + 0.02);
+    voices++;
+    s.onended = function () { voices = Math.max(0, voices - 1); };
+  }
+
+  /* ---- ① 投蛋：下落风声 ---- */
+  function sfxDrop(level) {
+    if (!audio()) return;
+    const bomb = level === 0;
+    noise(0.14, 0.07, bomb ? 1100 : 1700, 380, 1.6, 'bandpass');
+    note(bomb ? 190 : 300 + level * 16, bomb ? 120 : 190, 0.07, 'sine', 0.075);
+  }
+
+  /* ---- ② 落进框里：闷响 + 木质感，冲得越快越响 ---- */
+  function sfxLand(level, speed) {
+    if (!audio()) return;
+    const k = Math.max(0.3, Math.min(1, (speed || 300) / 850));
+    const f = (195 + level * 17) * (0.92 + 0.16 * Math.random());
+    note(f * 1.6, f * 0.6, 0.09, 'sine', 0.07 + 0.11 * k);
+    note(f * 3.2, f * 1.4, 0.04, 'triangle', 0.03 + 0.04 * k);
+    noise(0.05, 0.03 + 0.055 * k, 2800, 900, 1.1, 'bandpass');
+  }
+
+  /* ---- ③ 合成：五声音阶逐级往上走，等级越高越亮 ---- */
+  const MERGE_STEPS = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21];
+  function sfxMerge(level, combo) {
+    if (!audio()) return;
+    const i = Math.max(0, Math.min(MERGE_STEPS.length - 1, level - 1));
+    let f = 261.63 * Math.pow(2, MERGE_STEPS[i] / 12);
+    const lift = Math.min(5, Math.max(0, (combo || 1) - 1));   // 连击把音高往上顶
+    f *= Math.pow(2, lift / 12);
+    const vol = 0.115 + Math.min(level, 8) * 0.009;
+
+    note(f, f, 0.26, 'triangle', vol);              // 琴身
+    note(f * 2, f * 2, 0.17, 'sine', vol * 0.5);    // 泛音，决定“亮”
+    note(f * 3.01, f * 3.01, 0.1, 'sine', vol * 0.2);
+    noise(0.02, vol * 0.5, 5200, 3200, 1.4, 'bandpass');   // 起音那一下“咔”
+    if (level >= 6) note(f * 4, f * 4, 0.22, 'triangle', vol * 0.22);
+  }
+
+  /* ---- ④ 炸弹：次低频冲击 + 火球噪声 + 高频碎屑 + 收尾叮 ---- */
+  function sfxBomb(cleared) {
+    if (!audio()) return;
+    note(150, 34, 0.5, 'sine', 0.30);                    // 冲击
+    note(92, 38, 0.34, 'sawtooth', 0.15);                // 爆裂体
+    noise(0.46, 0.26, 4200, 220, 0.7, 'lowpass');        // 火球
+    noise(0.08, 0.18, 6000, 2000, 0.9, 'highpass');      // 碎屑
+    note(70, 28, 0.62, 'sine', 0.13, 0.04);              // 余震尾音
+    if (cleared >= 3) {
+      const f = 540 + Math.min(cleared, 10) * 44;
+      note(f, f, 0.17, 'triangle', 0.06, 0.1);
+      note(f * 1.5, f * 1.5, 0.13, 'sine', 0.035, 0.12);
+    }
+  }
+
+  /* ---- 其它小音效沿用这个通用短音 ---- */
+  function tone(freq, dur, type, gain, endRatio) {
+    note(freq, freq * (endRatio || 0.62), dur || 0.1, type, gain || 0.07);
+  }
+
+  /* ==========================================================
+     6. 状态
+     ========================================================== */
+  const state = {
+    started: false,
+    over: false,
+    time: 0,
+    score: 0,
+    best: parseInt(localStorage.getItem('egg.best') || '0', 10) || 0,
+    scorePulse: 0,
+    shake: 0,
+    hint: 1,
+    dropped: false,
+    dangerT: 0,
+    bodies: [],
+    belt: [],
+    drag: null,         // 正在拖拽的蛋
+    combo: 0,
+    comboT: 999,
+    comboMax: 0,
+    parts: [],
+    pops: [],
+    rings: [],
+    booms: [],
+    overAnim: 0,
+    hover: null,
+    btnHover: false,
+    btn: null,
+  };
+
+  function randLevel() {
+    let r = Math.random() * SPAWN_TOTAL;
+    for (let i = 0; i < SPAWN.length; i++) {
+      r -= SPAWN[i].w;
+      if (r <= 0) return SPAWN[i].lv;
+    }
+    return SPAWN[SPAWN.length - 1].lv;
+  }
+
+  /* ==========================================================
+     7. 顶部的蛋（同尺寸，从左往右滚动）
+     ========================================================== */
+  function initBelt() {
+    state.belt = [];
+    for (let i = 0; i < BELT_COUNT; i++) {
+      state.belt.push({
+        level: randLevel(),
+        x: BELT.x + 24 + i * SPACING,
+        a: Math.random() * Math.PI * 2,
+        empty: false,
+        dragging: false,
+        timer: 0,
+        scale: 1
+      });
+    }
+  }
+
+  function updateBelt(dt) {
+    const belt = state.belt;
+    const speed = BELT_SPEED * (state.over ? 0 : 1);
+    let minX = Infinity;
+    for (let i = 0; i < belt.length; i++) if (belt[i].x < minX) minX = belt[i].x;
+
+    for (let i = 0; i < belt.length; i++) {
+      const e = belt[i];
+      e.x += speed * dt;
+      e.a += (speed / BELT_R) * dt;                  // 滚动
+
+      if (e.empty) {
+        e.timer -= dt;
+        if (e.timer <= 0) {
+          e.empty = false;
+          e.level = randLevel();
+          e.scale = 0;
+        }
+      }
+      if (e.scale < 1) e.scale = Math.min(1, e.scale + dt * 6.5);
+
+      if (e.x > BELT.x + BELT.w + 46) {              // 从右边滚出去 -> 回到最左边
+        e.x = minX - SPACING;
+        if (!e.dragging) e.level = randLevel();
+        minX = e.x;
+        if (e.empty) { e.empty = false; e.scale = 1; }
+      }
+    }
+  }
+
+  function beltAlpha(e) {
+    const d = Math.min(e.x - BELT.x, BELT.x + BELT.w - e.x);
+    return Math.max(0, Math.min(1, d / 30));
+  }
+
+  /* ==========================================================
+     8. 蛋（物理刚体）
+     ========================================================== */
+  function makeBody(x, y, level, vx, vy, av) {
+    const r = LEVELS[level].r;
+    const m = Math.PI * r * r * 0.001;
+    const I = 0.5 * m * r * r;
+    return {
+      x: x, y: y, r: r, level: level, scale: 1,
+      bomb: level === 0, hit: false, landed: true,
+      vx: vx || 0, vy: vy || 0,
+      a: Math.random() * Math.PI * 2, av: av || 0,
+      m: m, invM: 1 / m, invI: 1 / I,
+      dead: false, lock: false,
+    };
+  }
+
+  function dropSlot(e) {
+    e.empty = true;
+    e.dragging = false;
+    e.timer = 0.16;
+    e.scale = 1;
+  }
+
+  // 在 (x, y) 放下一颗蛋：拖拽松手和点击都会走这里
+  function releaseEgg(level, x, y, av) {
+    const r = LEVELS[level].r;
+    x = Math.max(FIELD.left + r, Math.min(FIELD.right - r, x));
+    y = Math.max(BELT.y + BELT.h + r, Math.min(LINE_Y - r, y));
+    const b = makeBody(x, y, level, 0, 90, av || 0);
+    b.scale = 1;
+    b.landed = false;                // 还没落定 -> 第一次碰到底/其它蛋时出声
+    state.bodies.push(b);
+    state.dropped = true;
+    state.combo = 0;                 // 新的一颗蛋 -> 重新开始算连击
+    state.comboT = COMBO_GAP + 1;
+    sfxDrop(level);                  // ① 下落风声
+  }
+
+  // 快捷键 / 自动演示用：直接丢掉队列里的一颗
+  function dropEgg(beltEgg) {
+    const level = beltEgg.level;
+    const r = LEVELS[level].r;
+    dropSlot(beltEgg);
+    releaseEgg(level, beltEgg.x, BELT.y + BELT.h + r, BELT_SPEED / BELT_R);
+  }
+
+  function clampDrag(d) {
+    const r = LEVELS[d.level].r;
+    d.x = Math.max(FIELD.left + r, Math.min(FIELD.right - r, d.x));
+    d.y = Math.max(BELT.y + BELT.h + r, Math.min(LINE_Y - r, d.y));
+  }
+
+  /* ---- 碰撞：蛋 vs 蛋 ---- */
+  function pair(a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const rr = a.r + b.r;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= rr * rr) return false;
+
+    if (a.bomb) a.hit = true;            // 炸弹一碰到东西就引爆
+    if (b.bomb) b.hit = true;
+
+    let d = Math.sqrt(d2);
+    let nx, ny;
+    if (d < 0.0001) { nx = 0; ny = -1; d = 0.0001; } else { nx = dx / d; ny = dy / d; }
+    const pen = rr - d;
+
+    const rax = nx * a.r, ray = ny * a.r;
+    const rbx = -nx * b.r, rby = -ny * b.r;
+
+    const vax = a.vx - a.av * ray, vay = a.vy + a.av * rax;
+    const vbx = b.vx - b.av * rby, vby = b.vy + b.av * rbx;
+    const rvx = vbx - vax, rvy = vby - vay;
+    const vn = rvx * nx + rvy * ny;
+
+    if (vn < 0) {
+      // 新投下的蛋第一次真正撞上蛋堆 -> 落定音效
+      if (vn < -90) {
+        if (!a.landed) { a.landed = true; if (!a.bomb) sfxLand(a.level, -vn); }
+        if (!b.landed) { b.landed = true; if (!b.bomb) sfxLand(b.level, -vn); }
+      }
+      const e = (-vn < 70) ? 0 : REST;
+      const kn = a.invM + b.invM;
+      const jn = -(1 + e) * vn / kn;
+      a.vx -= jn * nx * a.invM; a.vy -= jn * ny * a.invM;
+      b.vx += jn * nx * b.invM; b.vy += jn * ny * b.invM;
+
+      // 切向摩擦 -> 产生滚动
+      const tx = -ny, ty = nx;
+      const vt = rvx * tx + rvy * ty;
+      const kt = 3 * (a.invM + b.invM);
+      let jt = -vt / kt;
+      const maxF = FRIC * Math.abs(jn);
+      if (jt > maxF) jt = maxF; else if (jt < -maxF) jt = -maxF;
+
+      a.vx -= jt * tx * a.invM; a.vy -= jt * ty * a.invM;
+      b.vx += jt * tx * b.invM; b.vy += jt * ty * b.invM;
+      a.av -= jt * a.r * a.invI;
+      b.av -= jt * b.r * b.invI;
+    }
+
+    const corr = Math.max(pen - SLOP, 0) * POS_PCT / (a.invM + b.invM);
+    a.x -= nx * corr * a.invM; a.y -= ny * corr * a.invM;
+    b.x += nx * corr * b.invM; b.y += ny * corr * b.invM;
+    return true;
+  }
+
+  /* ---- 碰撞：蛋 vs 墙（n 指向蛋、把蛋往内推） ---- */
+  function wall(b, nx, ny, pen) {
+    b.x += nx * pen; b.y += ny * pen;
+    const rx = -nx * b.r, ry = -ny * b.r;
+    const vpx = b.vx - b.av * ry, vpy = b.vy + b.av * rx;
+    const vn = vpx * nx + vpy * ny;
+
+    if (b.bomb) b.hit = true;            // 炸弹碰到墙/地面也引爆
+    // 新投下的蛋落到框底 -> 落定音效（只在底面、且确实在往下冲时触发）
+    if (!b.landed && vn < -90 && ny < -0.5) {
+      b.landed = true;
+      if (!b.bomb) sfxLand(b.level, -vn);
+    }
+    if (vn >= 0) return;
+
+    const e = (-vn < 90) ? 0 : WALL_REST;
+    const jn = -(1 + e) * vn / b.invM;
+    b.vx += jn * nx * b.invM; b.vy += jn * ny * b.invM;
+
+    const tx = -ny, ty = nx;
+    const vt = vpx * tx + vpy * ty;
+    const kt = b.invM + b.r * b.r * b.invI;
+    let jt = -vt / kt;
+    const maxF = WALL_FRIC * Math.abs(jn);
+    if (jt > maxF) jt = maxF; else if (jt < -maxF) jt = -maxF;
+    b.vx += jt * tx * b.invM; b.vy += jt * ty * b.invM;
+    b.av += (-jt * b.r) * b.invI;
+  }
+
+  function step(dt) {
+    const bs = state.bodies;
+    for (let i = 0; i < bs.length; i++) {
+      const b = bs[i];
+      b.vy += GRAV * dt;
+      b.vx *= 0.9994; b.vy *= 0.9994; b.av *= 0.996;
+      const s2 = b.vx * b.vx + b.vy * b.vy;
+      if (s2 > MAXV * MAXV) { const k = MAXV / Math.sqrt(s2); b.vx *= k; b.vy *= k; }
+      b.x += b.vx * dt; b.y += b.vy * dt; b.a += b.av * dt;
+    }
+
+    for (let it = 0; it < ITERS; it++) {
+      for (let i = 0; i < bs.length; i++) {
+        const a = bs[i];
+        for (let j = i + 1; j < bs.length; j++) pair(a, bs[j]);
+      }
+      for (let i = 0; i < bs.length; i++) {
+        const b = bs[i];
+        if (b.x - b.r < FIELD.left)  wall(b,  1, 0, FIELD.left - (b.x - b.r));
+        if (b.x + b.r > FIELD.right) wall(b, -1, 0, (b.x + b.r) - FIELD.right);
+        if (b.y + b.r > FIELD.bottom) wall(b, 0, -1, (b.y + b.r) - FIELD.bottom);
+      }
+    }
+  }
+
+  /* ==========================================================
+     9. 合成
+     ========================================================== */
+  function tryMerges() {
+    let guard = 0;
+    let any = true;
+    while (any && guard++ < 8) {
+      any = false;
+      const bs = state.bodies;
+      for (let i = 0; i < bs.length; i++) {
+        const a = bs[i];
+        if (a.dead || a.lock || a.level >= MAX_LEVEL || a.level === 0) continue;
+        for (let j = i + 1; j < bs.length; j++) {
+          const b = bs[j];
+          if (b.dead || b.lock || b.level !== a.level || b.level === 0) continue;
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const rr = a.r + b.r + 0.9;
+          if (dx * dx + dy * dy > rr * rr) continue;
+          doMerge(a, b);
+          any = true;
+          break;
+        }
+        if (any) break;
+      }
+    }
+    for (let i = state.bodies.length - 1; i >= 0; i--) {
+      if (state.bodies[i].dead) state.bodies.splice(i, 1);
+    }
+    for (let i = 0; i < state.bodies.length; i++) state.bodies[i].lock = false;
+  }
+
+  function doMerge(a, b) {
+    a.dead = b.dead = true;
+    const mt = a.m + b.m;
+    const cx = (a.x * a.m + b.x * b.m) / mt;
+    const cy = (a.y * a.m + b.y * b.m) / mt;
+    const lvl = a.level;
+    const spr = sprites[lvl] || sprites[1];
+    const color = spr ? spr.color : '#d8c3ae';
+
+    const nvx = (a.vx * a.m + b.vx * b.m) / mt;
+    const nvy = (a.vy * a.m + b.vy * b.m) / mt;
+    const nav = (a.av * a.m + b.av * b.m) / mt;
+    const n = makeBody(cx, cy, lvl + 1, nvx * 0.5, nvy * 0.5 - 30, nav * 0.6);
+    n.lock = true;
+    state.bodies.push(n);
+
+    // 连击：一串连续合成
+    state.combo = (state.comboT > COMBO_GAP) ? 1 : state.combo + 1;
+    state.comboT = 0;
+    if (state.combo > state.comboMax) state.comboMax = state.combo;
+    const bonus = state.combo >= COMBO_MIN ? COMBO_BONUS : 0;
+
+    addScore(mergePoints(lvl + 1) + bonus, cx, cy, state.combo, bonus);
+    burst(cx, cy, color, 10 + lvl * 3, LEVELS[lvl + 1].r);
+    ring(cx, cy, LEVELS[lvl + 1].r);
+    sfxMerge(lvl, state.combo);      // ③ 合成音效
+    state.shake = Math.min(0.55, 0.16 + lvl * 0.05);
+  }
+
+  function addScore(n, x, y, combo, bonus) {
+    state.score += n;
+    state.scorePulse = 1;
+    state.pops.push({
+      x: x, y: y, text: '+' + n, t: 0, life: 1.05,
+      combo: combo || 0, bonus: bonus || 0
+    });
+    if (combo >= COMBO_MIN) tone(620 + combo * 40, 0.16, 'square', 0.035, 0.9);
+  }
+
+  function burst(x, y, color, n, rad) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = 60 + Math.random() * 220;
+      state.parts.push({
+        x: x, y: y,
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60,
+        r: 2 + Math.random() * (rad * 0.09 + 2.5),
+        t: 0, life: 0.5 + Math.random() * 0.5,
+        color: color
+      });
+    }
+  }
+
+  function ring(x, y, r) {
+    state.rings.push({ x: x, y: y, r0: r * 0.55, r1: r * 1.65, t: 0, life: 0.42 });
+  }
+
+  /* ==========================================================
+     9.5 炸弹：落进框里一碰就爆，清掉周围一小片
+     ========================================================== */
+  function processBombs() {
+    let guard = 0;
+    while (guard++ < 8) {
+      let bomb = null;
+      for (let i = 0; i < state.bodies.length; i++) {
+        const b = state.bodies[i];
+        if (b.bomb && b.hit && !b.dead) { bomb = b; break; }
+      }
+      if (!bomb) break;
+      explode(bomb);
+    }
+  }
+
+  function explode(bomb) {
+    const cx = bomb.x, cy = bomb.y;
+    bomb.dead = true;
+
+    let cleared = 0;
+    for (let i = 0; i < state.bodies.length; i++) {
+      const o = state.bodies[i];
+      if (o === bomb || o.dead) continue;
+      const dx = o.x - cx, dy = o.y - cy;
+      const reach = BLAST_R + o.r * 0.35;
+      if (dx * dx + dy * dy > reach * reach) continue;
+      if (o.bomb) { o.hit = true; continue; }        // 连锁：把别的炸弹也点了
+      o.dead = true;
+      cleared++;
+    }
+    for (let i = state.bodies.length - 1; i >= 0; i--) {
+      if (state.bodies[i].dead) state.bodies.splice(i, 1);
+    }
+
+    // 特效
+    state.booms.push({ x: cx, y: cy, t: 0, life: 0.5, R: BLAST_R });
+    state.rings.push({ x: cx, y: cy, r0: 10, r1: BLAST_R * 1.2, t: 0, life: 0.5 });
+    burst(cx, cy, '#ff7a3c', 34, BLAST_R * 0.9);
+    burst(cx, cy, '#ffd9a0', 16, BLAST_R * 0.5);
+    state.shake = 1.1;
+    sfxBomb(cleared);                // ④ 炸弹消除音效
+
+    // 爆炸固定 250 分（连锁引爆的每颗炸弹各计一次）
+    addScore(BOMB_PTS, cx, cy - 10, 0, 0);
+  }
+
+  /* ==========================================================
+     10. 结束判定：静止的蛋堆顶到红线一段时间就结束
+     ========================================================== */
+  const DANGER_HOLD = 0.8;                 // 压在线上多久判负
+  const REST_SPEED = 460;                  // 低于这个速度算“落定”
+
+  function checkDanger(dt) {
+    let pile = Infinity;
+    for (let i = 0; i < state.bodies.length; i++) {
+      const b = state.bodies[i];
+      if (b.vx * b.vx + b.vy * b.vy > REST_SPEED * REST_SPEED) continue;  // 还在飞的不算
+      if (b.y - b.r < pile) pile = b.y - b.r;
+    }
+    state.pileH = pile;
+    if (pile < DANGER_Y) state.dangerT = Math.min(3, state.dangerT + dt);
+    else state.dangerT = Math.max(0, state.dangerT - dt * 2.5);
+    if (state.dangerT > DANGER_HOLD) gameOver();
+  }
+
+  function gameOver() {
+    if (state.over) return;
+    state.over = true;
+    state.overAnim = 0;
+    state.shake = 1;
+    if (state.drag) finishDrag(false);
+    if (state.score > state.best) {
+      state.best = state.score;
+      try { localStorage.setItem('egg.best', String(state.best)); } catch (e) {}
+    }
+    tone(320, 0.22, 'sawtooth', 0.06, 0.5);
+    setTimeout(function () { tone(190, 0.42, 'sawtooth', 0.06, 0.35); }, 150);
+  }
+
+  function reset() {
+    state.bodies.length = 0;
+    state.parts.length = 0;
+    state.pops.length = 0;
+    state.rings.length = 0;
+    state.score = 0;
+    state.over = false;
+    state.overAnim = 0;
+    state.hint = 1;
+    state.dropped = false;
+    state.dangerT = 0;
+    state.shake = 0;
+    state.scorePulse = 0;
+    state.btnHover = false;
+    state.drag = null;
+    state.combo = 0;
+    state.comboT = 999;
+    state.comboMax = 0;
+    state.booms.length = 0;
+    initBelt();
+  }
+
+  /* ==========================================================
+     11. 主更新
+     ========================================================== */
+  let acc = 0;
+
+  function update(dt) {
+    state.time += dt;
+    if (state.scorePulse > 0) state.scorePulse = Math.max(0, state.scorePulse - dt * 3.2);
+    if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 2.4);
+    if (state.dropped && state.hint > 0) state.hint = Math.max(0, state.hint - dt * 2.4);
+
+    // 连击计时
+    state.comboT += dt;
+    if (state.combo > 0 && state.comboT > COMBO_GAP) state.combo = 0;
+
+    // 拖拽中的蛋：保持滚动、尺寸过渡到真实大小
+    if (state.drag) {
+      const d = state.drag;
+      d.angle += dt * 1.2;
+      clampDrag(d);
+      if (d.scale < 1) d.scale = Math.min(1, d.scale + dt * 9);
+    }
+
+    updateBelt(dt);
+
+    if (!state.over && state.bodies.length) {
+      acc += dt;
+      let n = 0;
+      while (acc >= DT && n < 8) { step(DT); acc -= DT; n++; }
+      if (n >= 8) acc = 0;
+      processBombs();
+      tryMerges();
+      checkDanger(dt);
+    } else {
+      acc = 0;
+    }
+
+    // 下落动画：尺寸过渡
+    for (let i = 0; i < state.bodies.length; i++) {
+      const b = state.bodies[i];
+      if (b.scale < 1) b.scale = Math.min(1, b.scale + dt * 7);
+    }
+
+    // 粒子
+    for (let i = state.parts.length - 1; i >= 0; i--) {
+      const p = state.parts[i];
+      p.t += dt;
+      if (p.t >= p.life) { state.parts.splice(i, 1); continue; }
+      p.vy += 900 * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.99;
+    }
+    for (let i = state.rings.length - 1; i >= 0; i--) {
+      const r = state.rings[i];
+      r.t += dt;
+      if (r.t >= r.life) state.rings.splice(i, 1);
+    }
+    for (let i = state.booms.length - 1; i >= 0; i--) {
+      const b = state.booms[i];
+      b.t += dt;
+      if (b.t >= b.life) state.booms.splice(i, 1);
+    }
+    for (let i = state.pops.length - 1; i >= 0; i--) {
+      const p = state.pops[i];
+      p.t += dt;
+      if (p.t >= p.life) state.pops.splice(i, 1);
+    }
+
+    if (state.over) state.overAnim = Math.min(1, state.overAnim + dt * 4);
+  }
+
+  /* ==========================================================
+     12. 绘制工具
+     ========================================================== */
+  function rrect(x, y, w, h, r) {
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+  }
+
+  function drawEggShape(level, x, y, rr, rot, sc, alpha) {
+    const s = sprites[level];
+    ctx.save();
+    ctx.translate(x, y);
+    if (rot) ctx.rotate(rot);
+    const h = rr * 2 * SPRITE_K * (sc == null ? 1 : sc);
+    const w = h * (s ? s.aspect : 0.8);
+    ctx.globalAlpha = alpha == null ? 1 : alpha;
+    if (s && assetsReady) {
+      ctx.shadowColor = 'rgba(60,40,20,0.18)';
+      ctx.shadowBlur = 10;
+      ctx.shadowOffsetY = 4;
+      ctx.drawImage(s.cv, -w / 2, -h / 2, w, h);
+    } else {
+      ctx.beginPath(); ctx.arc(0, 0, rr, 0, Math.PI * 2);
+      ctx.fillStyle = '#e8d9c6'; ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /* ==========================================================
+     13. 渲染
+     ========================================================== */
+  function render() {
+    const k = scale * dpr;
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    ctx.clearRect(0, 0, VW, VH);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, VW, VH);
+
+    ctx.save();
+    if (state.shake > 0) {
+      const s = state.shake * state.shake * 9;
+      ctx.translate((Math.random() - 0.5) * s, (Math.random() - 0.5) * s);
+    }
+
+    drawBelt();
+    drawBoxFill();
+    drawDropGuide();
+    drawBodies();
+    drawBoxFrame();
+    drawDragEgg();
+    drawFx();
+    drawHint();
+    ctx.restore();
+
+    if (state.over) drawOverlay();
+    drawHud();
+  }
+
+  /* ---- 拖拽中的蛋 ---- */
+  function drawDragEgg() {
+    const d = state.drag;
+    if (!d) return;
+    const r = LEVELS[d.level].r;
+    const isBomb = d.level === 0;
+
+    // 阴影
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, r + 7, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.06)';
+    ctx.fill();
+    ctx.restore();
+
+    if (isBomb) {
+      // 炸弹：红色光晕 + 颜色闪烁
+      const t = state.time;
+      const pulse = 0.5 + 0.5 * Math.sin(t * 18);
+      ctx.save();
+      const g = ctx.createRadialGradient(d.x, d.y, r * 0.6, d.x, d.y, r * 2.1);
+      g.addColorStop(0, 'rgba(255,80,40,' + (0.30 + 0.35 * pulse) + ')');
+      g.addColorStop(1, 'rgba(255,80,40,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, r * 2.1, 0, Math.PI * 2);
+      ctx.fill();
+      // 虚线预警圈（爆炸半径）
+      ctx.globalAlpha = 0.18 + 0.16 * pulse;
+      ctx.strokeStyle = '#ff4a26';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([7, 9]);
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, BLAST_R, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    drawEggShape(d.level, d.x, d.y, r, d.angle, d.scale, 1);
+
+    if (isBomb) {
+      // 叠加红色剪影，透明度做闪烁
+      const s = sprites[0];
+      if (s && s.tint) {
+        const pulse = 0.5 + 0.5 * Math.sin(state.time * 18);
+        const h = r * 2 * SPRITE_K * d.scale;
+        const w = h * s.aspect;
+        ctx.save();
+        ctx.translate(d.x, d.y);
+        ctx.rotate(d.angle);
+        ctx.globalAlpha = 0.10 + 0.58 * pulse;
+        ctx.drawImage(s.tint, -w / 2, -h / 2, w, h);
+        ctx.restore();
+      }
+    }
+  }
+
+  /* ---- 拖拽提示 ---- */
+  function drawHint() {
+    if (state.hint <= 0 || state.drag) return;
+    ctx.save();
+    ctx.globalAlpha = state.hint * 0.9;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#b9b3a8';
+    ctx.font = '600 12px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('按住上方的蛋，拖到框上方，松手掉落', GAME_W / 2, 236);
+    ctx.font = '600 11px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.globalAlpha = state.hint * 0.65;
+    ctx.fillText('同级别相撞即合成 · 炸弹蛋落进框里会引爆', GAME_W / 2, 258);
+    ctx.restore();
+  }
+
+  /* ---- 顶部滚动排 ---- */
+  function drawBelt() {
+    // 轨道
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.05)';
+    ctx.shadowBlur = 12;
+    ctx.shadowOffsetY = 3;
+    rrect(BELT.x, BELT.y, BELT.w, BELT.h, BELT.r);
+    ctx.fillStyle = '#f6f5f2';
+    ctx.fill();
+    ctx.restore();
+
+    rrect(BELT.x, BELT.y, BELT.w, BELT.h, BELT.r);
+    ctx.strokeStyle = '#e7e4dd';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // 虚线中线
+    ctx.save();
+    rrect(BELT.x + 1, BELT.y + 1, BELT.w - 2, BELT.h - 2, BELT.r - 1);
+    ctx.clip();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = '#dcd8cf';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 7]);
+    ctx.beginPath();
+    ctx.moveTo(BELT.x, BELT.cy + BELT.h * 0.36);
+    ctx.lineTo(BELT.x + BELT.w, BELT.cy + BELT.h * 0.36);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 蛋
+    for (let i = 0; i < state.belt.length; i++) {
+      const e = state.belt[i];
+      const al = beltAlpha(e);
+      if (al <= 0.01) continue;
+      const isHover = state.hover && state.hover.egg === e;
+      if (e.dragging) continue;
+      if (e.empty) {
+        ctx.globalAlpha = 0.25 * al;
+        ctx.beginPath();
+        ctx.arc(e.x, BELT.cy, BELT_R * 0.72, 0, Math.PI * 2);
+        ctx.strokeStyle = '#c9c4ba';
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+        continue;
+      }
+      if (isHover) {
+        ctx.save();
+        ctx.globalAlpha = 0.5 * al;
+        ctx.beginPath();
+        ctx.arc(e.x, BELT.cy, BELT_R + 6, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(0,0,0,0.07)';
+        ctx.fill();
+        ctx.restore();
+      }
+      drawEggShape(e.level, e.x, BELT.cy, BELT_R, e.a, e.scale, al);
+    }
+    ctx.restore();
+  }
+
+  /* ---- 瞄准虚线 ---- */
+  function drawDropGuide() {
+    if (state.over) return;
+    let r, x, top;
+    if (state.drag) {
+      r = LEVELS[state.drag.level].r;
+      x = state.drag.x;
+      top = state.drag.y + r + 4;
+    } else {
+      const h = state.hover;
+      if (!h || !h.egg || h.egg.empty || h.egg.dragging) return;
+      const al = beltAlpha(h.egg);
+      if (al < 0.3) return;
+      r = LEVELS[h.egg.level].r;
+      x = Math.max(FIELD.left + r, Math.min(FIELD.right - r, h.egg.x));
+      top = BELT.y + BELT.h - 4;
+    }
+
+    ctx.save();
+    ctx.globalAlpha = 0.30;
+    ctx.strokeStyle = '#b9b3a8';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 8]);
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, BOX.y + 34);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.16;
+    ctx.beginPath();
+    ctx.arc(x, BOX.y + 44, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#8d8578';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /* ---- 黑色方框：内衬（画在蛋下面） ---- */
+  function drawBoxFill() {
+    ctx.fillStyle = '#fcfbf9';
+    ctx.fillRect(BOX.x + 1, BOX.y + 1, BOX.w - 2, BOX.h - 1);
+    ctx.save();
+    rrect(BOX.x + FRAME, BOX.y + FRAME, BOX.w - FRAME * 2, BOX.h - FRAME, 0);
+    ctx.clip();
+    const g = ctx.createLinearGradient(0, BOX.y, 0, BOX.y + BOX.h);
+    g.addColorStop(0, 'rgba(0,0,0,0.035)');
+    g.addColorStop(0.4, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.02)');
+    ctx.fillStyle = g;
+    ctx.fillRect(BOX.x, BOX.y, BOX.w, BOX.h);
+    ctx.restore();
+  }
+
+  /* ---- 黑色方框：边框（画在蛋上面，蛋看起来像落在框里） ---- */
+  function drawBoxFrame() {
+    const danger = Math.max(0, Math.min(1, state.dangerT / DANGER_HOLD));
+    const pile = pileTop();
+    const near = Math.max(0, Math.min(1, (LINE_Y + 110 - pile) / 110));
+
+    // 黑框：左、右、底
+    ctx.fillStyle = '#0d0d0d';
+    ctx.fillRect(BOX.x, BOX.y, FRAME, BOX.h);
+    ctx.fillRect(BOX.x + BOX.w - FRAME, BOX.y, FRAME, BOX.h);
+    ctx.fillRect(BOX.x, BOX.y + BOX.h - FRAME, BOX.w, FRAME);
+
+    // 顶部：红色满线
+    ctx.save();
+    ctx.shadowColor = 'rgba(226,32,32,' + (0.25 + 0.55 * Math.max(danger, near * 0.5)) + ')';
+    ctx.shadowBlur = 8 + 22 * Math.max(danger, near * 0.6);
+    ctx.shadowOffsetY = 0;
+    ctx.fillStyle = danger > 0.02 ? '#ff2a2a' : '#e21f1f';
+    ctx.fillRect(BOX.x, BOX.y, BOX.w, FRAME);
+    ctx.restore();
+
+    // 满线文字
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = '#e21f1f';
+    ctx.font = '600 10px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('满 线', BOX.x + 1, BOX.y - 7);
+    ctx.restore();
+  }
+
+  function pileTop() {
+    let top = LINE_Y + 200;
+    for (let i = 0; i < state.bodies.length; i++) {
+      const b = state.bodies[i];
+      if (b.y - b.r < top) top = b.y - b.r;
+    }
+    return top;
+  }
+
+  /* ---- 框里的蛋 ---- */
+  function drawBodies() {
+    for (let i = 0; i < state.bodies.length; i++) {
+      const b = state.bodies[i];
+      if (state.dangerT > 0.02 && (b.y - b.r) < DANGER_Y) {
+        ctx.save();
+        ctx.globalAlpha = Math.min(0.5, state.dangerT * 1.2);
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r * 1.12, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(226,31,31,0.30)';
+        ctx.fill();
+        ctx.restore();
+      }
+      drawEggShape(b.level, b.x, b.y, b.r, b.a, b.scale, 1);
+    }
+  }
+
+  /* ---- 粒子 / 光环 / 飘分 ---- */
+  function drawFx() {
+    // 爆炸火球
+    for (let i = 0; i < state.booms.length; i++) {
+      const bm = state.booms[i];
+      const p = bm.t / bm.life;
+      const rr = bm.R * (0.35 + 0.85 * (1 - Math.pow(1 - p, 3)));
+      ctx.save();
+      ctx.globalAlpha = Math.pow(1 - p, 1.4);
+      const g = ctx.createRadialGradient(bm.x, bm.y, 0, bm.x, bm.y, rr);
+      g.addColorStop(0, 'rgba(255,244,206,0.95)');
+      g.addColorStop(0.3, 'rgba(255,140,50,0.88)');
+      g.addColorStop(0.68, 'rgba(232,60,26,0.55)');
+      g.addColorStop(1, 'rgba(190,36,18,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(bm.x, bm.y, rr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    for (let i = 0; i < state.rings.length; i++) {
+      const r = state.rings[i];
+      const p = r.t / r.life;
+      const rr = r.r0 + (r.r1 - r.r0) * (1 - Math.pow(1 - p, 2));
+      ctx.save();
+      ctx.globalAlpha = (1 - p) * 0.55;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, rr, 0, Math.PI * 2);
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 3.5 * (1 - p) + 0.6;
+      ctx.stroke();
+      ctx.restore();
+    }
+    for (let i = 0; i < state.parts.length; i++) {
+      const p = state.parts[i];
+      const a = 1 - p.t / p.life;
+      ctx.save();
+      ctx.globalAlpha = a * 0.9;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r * (0.4 + a * 0.6), 0, Math.PI * 2);
+      ctx.fillStyle = p.color;
+      ctx.fill();
+      ctx.restore();
+    }
+    for (let i = 0; i < state.pops.length; i++) {
+      const p = state.pops[i];
+      const k = p.t / p.life;
+      const a = k < 0.15 ? k / 0.15 : 1 - Math.pow((k - 0.15) / 0.85, 2);
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, a);
+      ctx.translate(p.x, p.y - 16 - k * 46);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '800 19px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+      ctx.strokeText(p.text, 0, 0);
+      ctx.fillStyle = '#e21f1f';
+      ctx.fillText(p.text, 0, 0);
+
+      // 连击标签
+      if (p.combo >= 2) {
+        const label = '连击 x' + p.combo + (p.bonus ? '  +' + p.bonus : '');
+        ctx.font = '800 11px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+        const tw = ctx.measureText(label).width + 14;
+        const ty = 16;
+        rrect(-tw / 2, ty - 8, tw, 16, 8);
+        ctx.fillStyle = p.bonus ? '#e21f1f' : '#f2b01e';
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(label, 0, ty + 0.5);
+      }
+      ctx.restore();
+    }
+  }
+
+  /* ---- 顶部计数框 ---- */
+  function drawHud() {
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.07)';
+    ctx.shadowBlur = 14;
+    ctx.shadowOffsetY = 4;
+    rrect(HUD.x, HUD.y, HUD.w, HUD.h, HUD.r);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+    ctx.restore();
+
+    rrect(HUD.x, HUD.y, HUD.w, HUD.h, HUD.r);
+    ctx.strokeStyle = '#0d0d0d';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // 标志
+    drawEggShape(MAX_LEVEL, HUD.x + 34, HUD.y + HUD.h / 2, 17, -0.12, 1, 1);
+
+    // 名字
+    ctx.save();
+    ctx.fillStyle = '#0d0d0d';
+    ctx.font = '800 27px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('egg', HUD.x + 60, HUD.y + 45);
+    ctx.restore();
+
+    // 最高分
+    ctx.save();
+    ctx.fillStyle = '#a6a09a';
+    ctx.font = '600 12px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('最高 ' + state.best, HUD.x + 148, HUD.y + 44);
+    ctx.restore();
+
+    // 静音按钮
+    const bx = HUD.x + HUD.w - 148, by = HUD.y + HUD.h / 2, br = 12;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(bx, by, br, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.04)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.10)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = muted ? '#b3ada6' : '#5d5852';
+    ctx.beginPath();
+    ctx.moveTo(bx - 5, by - 2.4);
+    ctx.lineTo(bx - 2.4, by - 2.4);
+    ctx.lineTo(bx + 1, by - 5.6);
+    ctx.lineTo(bx + 1, by + 5.6);
+    ctx.lineTo(bx - 2.4, by + 2.4);
+    ctx.lineTo(bx - 5, by + 2.4);
+    ctx.closePath();
+    ctx.fill();
+    if (muted) {
+      ctx.strokeStyle = '#d64545';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(bx + 3.5, by - 3.5); ctx.lineTo(bx + 7, by + 3.5);
+      ctx.moveTo(bx + 7, by - 3.5); ctx.lineTo(bx + 3.5, by + 3.5);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = '#5d5852';
+      ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      ctx.arc(bx + 1.2, by, 4.6, -0.9, 0.9);
+      ctx.stroke();
+    }
+    ctx.restore();
+    state.muteBtn = { x: bx, y: by, r: br + 5 };
+
+    // 分数
+    ctx.save();
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'alphabetic';
+    if (state.over) {
+      ctx.fillStyle = '#e21f1f';
+      ctx.font = '800 12px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.fillText('游戏结束', HUD.x + HUD.w - 18, HUD.y + 26);
+    } else {
+      ctx.fillStyle = '#b5afa8';
+      ctx.font = '600 11px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.fillText('分数', HUD.x + HUD.w - 18, HUD.y + 26);
+    }
+    const p = state.scorePulse;
+    const sc = 1 + 0.14 * p;
+    ctx.translate(HUD.x + HUD.w - 18, HUD.y + 57);
+    ctx.scale(sc, sc);
+    ctx.fillStyle = '#0d0d0d';
+    ctx.font = '800 30px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText(String(state.score), 0, 0);
+    ctx.restore();
+  }
+
+  /* ---- 结束卡片 ---- */
+  function drawOverlay() {
+    const a = state.overAnim;
+    const CX = GAME_W / 2;
+    ctx.save();
+    ctx.globalAlpha = a * 0.82;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, VW, VH);
+    ctx.restore();
+
+    const W = 300, H = 268;
+    const x = CX - W / 2;
+    const y = BOX.y + 92 - (1 - a) * 18;
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.shadowColor = 'rgba(0,0,0,0.18)';
+    ctx.shadowBlur = 28;
+    ctx.shadowOffsetY = 12;
+    rrect(x, y, W, H, 26);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = a;
+    rrect(x, y, W, H, 26);
+    ctx.strokeStyle = '#0d0d0d';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+
+    ctx.fillStyle = '#e21f1f';
+    ctx.font = '800 27px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('游戏结束', CX, y + 54);
+
+    ctx.fillStyle = '#b5afa8';
+    ctx.font = '600 11px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText('本 局 得 分', CX, y + 86);
+
+    ctx.fillStyle = '#0d0d0d';
+    ctx.font = '800 46px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText(String(state.score), CX, y + 136);
+
+    ctx.fillStyle = '#a6a09a';
+    ctx.font = '600 12px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    const sub = state.comboMax >= 2
+      ? '最高分 ' + state.best + '　·　最高连击 x' + state.comboMax
+      : '最高分 ' + state.best;
+    ctx.fillText(sub, CX, y + 164);
+
+    // 按钮
+    const bw = 196, bh = 50;
+    const bx = CX - bw / 2, by = y + H - 74;
+    state.btn = { x: bx, y: by, w: bw, h: bh };
+    const hov = state.btnHover;
+    rrect(bx, by, bw, bh, 25);
+    ctx.fillStyle = hov ? '#2b2b2b' : '#0d0d0d';
+    ctx.fill();
+    if (hov) {
+      ctx.strokeStyle = 'rgba(226,31,31,0.85)';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 17px "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('再来一局', CX, by + bh / 2 + 1);
+    ctx.restore();
+  }
+
+  /* ==========================================================
+     14. 输入
+     ========================================================== */
+  function toLocal(ev) {
+    const r = cv.getBoundingClientRect();
+    return {
+      x: (ev.clientX - r.left) * (VW / r.width),
+      y: (ev.clientY - r.top) * (VH / r.height)
+    };
+  }
+
+  function pickBelt(x, y) {
+    if (y < BELT.y - 6 || y > BELT.y + BELT.h + 6) return null;
+    let best = null, bd = 1e9;
+    for (let i = 0; i < state.belt.length; i++) {
+      const e = state.belt[i];
+      if (e.empty || e.dragging) continue;
+      if (beltAlpha(e) < 0.25) continue;
+      const dx = e.x - x, dy = BELT.cy - y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < BELT_R + 10 && d < bd) { bd = d; best = e; }
+    }
+    return best;
+  }
+
+  function beginDrag(e, p) {
+    state.drag = {
+      level: e.level,
+      slot: e,
+      angle: e.a,
+      x: e.x,
+      y: BELT.cy,
+      offX: e.x - p.x,
+      offY: 0,
+      scale: BELT_R / LEVELS[e.level].r,
+      px: p.x,
+      py: p.y
+    };
+    e.dragging = true;
+    clampDrag(state.drag);
+    state.hover = null;
+    tone(560, 0.05, 'sine', 0.03, 0.9);
+  }
+
+  function finishDrag(commit) {
+    const d = state.drag;
+    if (!d) return;
+    state.drag = null;
+    if (commit && state.over) commit = false;      // 结束时不再投蛋
+    if (commit) {
+      dropSlot(d.slot);
+      releaseEgg(d.level, d.x, d.y, BELT_SPEED / BELT_R);
+    } else {
+      d.slot.dragging = false;
+    }
+  }
+
+  cv.addEventListener('pointermove', function (ev) {
+    const p = toLocal(ev);
+
+    if (state.drag) {                        // 拖拽中：跟随鼠标
+      state.drag.x = p.x + state.drag.offX;
+      state.drag.y = p.y + state.drag.offY;
+      clampDrag(state.drag);
+      cv.style.cursor = 'grabbing';
+      return;
+    }
+
+    state.hover = { egg: pickBelt(p.x, p.y), x: p.x, y: p.y };
+    const mb = state.muteBtn;
+    const overMute = mb && ((p.x - mb.x) ** 2 + (p.y - mb.y) ** 2) < (mb.r * mb.r);
+    const b = state.btn;
+    const overBtn = !!(b && p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h);
+    state.btnHover = overBtn;
+    cv.style.cursor = (state.hover.egg || overMute || overBtn) ? 'pointer' : 'default';
+  });
+
+  cv.addEventListener('pointerleave', function () {
+    if (state.drag) return;
+    state.hover = null;
+    state.btnHover = false;
+    cv.style.cursor = 'default';
+  });
+
+  cv.addEventListener('pointerdown', function (ev) {
+    ev.preventDefault();
+    unlockAudio();                                              // 手势里解冻音频
+    if (ev.pointerType === 'mouse' && ev.button !== 0) return;   // 只认左键
+    const p = toLocal(ev);
+
+    // 静音
+    const mb = state.muteBtn;
+    if (mb && ((p.x - mb.x) ** 2 + (p.y - mb.y) ** 2) < (mb.r * mb.r)) {
+      muted = !muted;
+      try { localStorage.setItem(MUTE_KEY, muted ? '1' : '0'); } catch (e) {}
+      if (!muted) tone(660, 0.09, 'sine', 0.05, 0.8);
+      return;
+    }
+
+    // 重新开始
+    if (state.over) {
+      const b = state.btn;
+      if (b && p.x >= b.x - 8 && p.x <= b.x + b.w + 8 && p.y >= b.y - 8 && p.y <= b.y + b.h + 8) {
+        reset();
+        tone(520, 0.1, 'sine', 0.05, 0.8);
+      }
+      return;
+    }
+
+    if (!state.started || state.drag) return;
+    const e = pickBelt(p.x, p.y);
+    if (e) {
+      beginDrag(e, p);
+      try { cv.setPointerCapture(ev.pointerId); } catch (_) {}
+    }
+  });
+
+  cv.addEventListener('pointerup', function (ev) {
+    if (!state.drag) return;
+    ev.preventDefault();
+    finishDrag(true);
+  });
+
+  // 在画布外松手也结束拖拽
+  window.addEventListener('pointerup', function () {
+    if (state.drag) finishDrag(true);
+  });
+
+  cv.addEventListener('pointercancel', function () {
+    finishDrag(false);
+  });
+
+  window.addEventListener('blur', function () {
+    finishDrag(false);
+  });
+
+  window.addEventListener('keydown', function (ev) {
+    unlockAudio();
+    if (ev.key === 'r' || ev.key === 'R') { if (state.over) reset(); }
+    if (ev.key === 'm' || ev.key === 'M') {
+      muted = !muted;
+      try { localStorage.setItem(MUTE_KEY, muted ? '1' : '0'); } catch (e) {}
+    }
+  });
+
+  /* ==========================================================
+     15. 主循环
+     ========================================================== */
+  let last = 0;
+  function loop(now) {
+    requestAnimationFrame(loop);
+    const t = now / 1000;
+    let dt = t - last;
+    last = t;
+    if (!isFinite(dt) || dt < 0) dt = 0;
+    if (dt > 0.05) dt = 0.05;
+    if (assetsReady) update(dt);
+    render();
+  }
+
+  initBelt();
+  loadAssets();
+  requestAnimationFrame(function (t) { last = t / 1000; requestAnimationFrame(loop); });
+
+
+})();
+</script>
+</body>
+</html>
